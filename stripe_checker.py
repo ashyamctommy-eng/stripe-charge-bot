@@ -174,6 +174,9 @@ async def process_stripe_charge(card_data, proxy_url=None):
             }
 
             endpoints = [
+                'https://app.gohighlevel.com/v1/checkout/charge',
+                'https://app.gohighlevel.com/api/v1/checkout/charge',
+                'https://app.gohighlevel.com/v1/checkout/session',
                 'https://services.leadconnectorhq.com/checkout/session',
                 'https://rest.gohighlevel.com/v1/checkout/session',
             ]
