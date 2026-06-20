@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+*.txt
+!requirements.txt
+approved_cards/
