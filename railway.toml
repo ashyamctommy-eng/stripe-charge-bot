@@ -1,8 +1,16 @@
 [build]
-  builder = "NIXPACKS"
-  buildCommand = "pip install -r requirements.txt"
+builder = "NIXPACKS"
+buildCommand = "pip install -r requirements.txt"
+buildEnvironment = "V3"
 
 [deploy]
-  startCommand = "python bot.py"
-  healthcheckPath = "/"
-  restartPolicyType = "ON_FAILURE"
+runtime = "V2"
+numReplicas = 1
+startCommand = "python bot.py"
+healthcheckPath = "/"
+sleepApplication = false
+useLegacyStacker = false
+ipv6EgressEnabled = false
+multiRegionConfig = {"sfo":{"numReplicas":1}}
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
