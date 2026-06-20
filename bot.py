@@ -503,14 +503,29 @@ async def async_main() -> None:
     await site.start()
     logger.info("Health check server on 0.0.0.0:%d", PORT)
 
+    # Delete webhook + wait for old connections to die
     await bot_app.bot.delete_webhook(drop_pending_updates=True)
     logger.info("Cleared stale webhook")
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(1)
 
     await bot_app.initialize()
     await bot_app.start()
-    await bot_app.updater.start_polling(drop_pending_updates=True)
-    logger.info("Bot polling started")
+
+    # Retry polling with backoff (handles 409 if old process still alive)
+    max_retries = 5
+    for attempt in range(1, max_retries + 1):
+        try:
+            await bot_app.updater.start_polling(drop_pending_updates=True)
+            logger.info("Bot polling started")
+            break
+        except Exception as e:
+            if '409' in str(e) and attempt < max_retries:
+                logger.warning("409 Conflict (attempt %d/%d), retrying in %ds...",
+                               attempt, max_retries, attempt * 2)
+                await asyncio.sleep(attempt * 2)
+                await bot_app.bot.delete_webhook(drop_pending_updates=True)
+            else:
+                raise
 
     try:
         await asyncio.Event().wait()
